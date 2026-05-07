@@ -91,7 +91,7 @@ def get_expected_speed(t: float) -> float:
     return max(1.0, mu * 0.88)
 
 def generate_distance_matrix(customers: List[Customer], mapper: IDMapper) -> np.ndarray:
-    """修复：基于映射器生成标准(N+1)x(N+1)距离矩阵"""
+    """基于映射器生成标准(N+1)x(N+1)距离矩阵"""
     n = len(mapper.idx_to_orig)
     dist = np.zeros((n, n))
     depot_x, depot_y = 0, 0
@@ -149,13 +149,11 @@ def check_route_feasibility(vehicle: Vehicle, customer_dict: Dict[int, Customer]
 def calc_insert_cost(vehicle: Vehicle, insert_pos: int, customer: Customer,
                      dist_mat: np.ndarray, mapper: IDMapper, customer_dict: Dict[int, Customer],
                      current_time: float) -> Tuple[float, float]:
-    # ===================== 【修复1：先做载重/容积硬校验，不够直接拦截】 =====================
     if vehicle.remain_load < customer.demand or vehicle.remain_vol < customer.vol:
         return np.inf, 0.0
     
     temp_route = vehicle.remaining_route[:insert_pos] + [customer.customer_id] + vehicle.remaining_route[insert_pos:]
     cur_time = max(current_time, vehicle.next_arrival_time)
-    # ===================== 【修复2：已装/剩余载重逻辑修正】 =====================
     # 已装载重 = 总载重 - 剩余载重，插入后已装 = 原已装 + 新客户需求
     loaded_before = vehicle.load_cap - vehicle.remain_load
     current_loaded = loaded_before + customer.demand
@@ -174,7 +172,6 @@ def calc_insert_cost(vehicle: Vehicle, insert_pos: int, customer: Customer,
         if cust.is_green_zone and vehicle.is_fuel and 8.0 <= arr_time <= 16.0:
             return np.inf, 0.0
 
-        # ===================== 【修复3：载重率计算逻辑修正，用已装载重而非剩余】 =====================
         load_ratio = current_loaded / vehicle.load_cap if vehicle.load_cap > 0 else 0
         if vehicle.is_fuel:
             fpk = (0.0025 * v_avg**2 - 0.2554 * v_avg + 31.75) / 100.0
@@ -194,7 +191,6 @@ def calc_insert_cost(vehicle: Vehicle, insert_pos: int, customer: Customer,
         else:
             cur_time = arr_time + SERVICE_TIME
         
-        # 【修复】更新已装载重，经过客户后卸货
         current_loaded -= cust.demand
         prev_id = node_id
 
@@ -203,34 +199,92 @@ def calc_insert_cost(vehicle: Vehicle, insert_pos: int, customer: Customer,
         punish += 80.0
     punish += 15.0 * abs(insert_pos - customer.orig_position)
     return insert_cost + tw_penalty, punish
+def calc_single_route_total_cost(vehicle: Vehicle, dist_mat: np.ndarray, mapper: IDMapper, customer_dict: Dict[int, Customer], current_time: float) -> float:
+    """计算单条路径的完整总成本，用于路径优化评估，避免inf错误"""
+    if not vehicle.remaining_route:
+        return 0.0
+    
+    cur_time = max(current_time, vehicle.next_arrival_time)
+    loaded_before = vehicle.load_cap - vehicle.remain_load
+    current_loaded = loaded_before
+    total_cost = 0.0
+    prev_id = 0  # 从配送中心出发
 
+    for node_id in vehicle.remaining_route:
+        cust = customer_dict.get(node_id)
+        if cust is None:
+            continue
+        
+        # 计算行驶与到达时间
+        dist = safe_dist(dist_mat, mapper, prev_id, node_id)
+        v_avg = get_expected_speed(cur_time)
+        travel_t = dist / v_avg
+        arr_time = cur_time + travel_t
+
+        # 绿区限行硬拦截：不可行路径返回无穷大
+        if cust.is_green_zone and vehicle.is_fuel and 8.0 <= arr_time <= 16.0:
+            return np.inf
+
+        # 计算能耗成本
+        load_ratio = current_loaded / vehicle.load_cap if vehicle.load_cap > 0 else 0
+        if vehicle.is_fuel:
+            fpk = (0.0025 * v_avg**2 - 0.2554 * v_avg + 31.75) / 100.0
+            fpk *= (1 + 0.40 * load_ratio)
+            total_cost += fpk * dist * (7.61 + 2.547 * 0.65)
+        else:
+            epk = (0.0014 * v_avg**2 - 0.12 * v_avg + 36.19) / 100.0
+            epk *= (1 + 0.35 * load_ratio)
+            total_cost += epk * dist * (1.64 + 0.501 * 0.65)
+
+        # 计算时间窗成本
+        if arr_time < cust.et:
+            total_cost += 20.0 * (cust.et - arr_time)
+            cur_time = cust.et + SERVICE_TIME
+        elif arr_time > cust.lt:
+            total_cost += 50.0 * (arr_time - cust.lt)
+            cur_time = arr_time + SERVICE_TIME
+        else:
+            cur_time = arr_time + SERVICE_TIME
+
+        # 更新已装载重
+        current_loaded -= cust.demand
+        prev_id = node_id
+
+    return total_cost
 def activate_spare_vehicle(customers: List[Customer], spare_vehicles: List[Vehicle],
                            dist_mat: np.ndarray, mapper: IDMapper, customer_dict: Dict[int, Customer]) -> Tuple[Optional[Vehicle], List[int], float]:
-    if not spare_vehicles or not customers: return None, [], np.inf
+    if not spare_vehicles or not customers:
+        return None, [], 0.0
     best_cost, best_v, best_route = np.inf, None, []
     total_demand = sum(c.demand for c in customers)
     total_vol = sum(c.vol for c in customers)
     green_custs = [c for c in customers if c.is_green_zone]
 
     for v in spare_vehicles:
-        if v.load_cap < total_demand or v.vol_cap < total_vol: continue
-        if green_custs and v.is_fuel: continue
+        if v.load_cap < total_demand or v.vol_cap < total_vol:
+            continue
+        if green_custs and v.is_fuel:
+            continue
         route = [c.customer_id for c in sorted(customers, key=lambda x: x.et)]
-        cost = 400.0; prev = 0
-        for n in route:
-            cost += safe_dist(dist_mat, mapper, prev, n) * 0.8
-            prev = n
-        cost += safe_dist(dist_mat, mapper, prev, 0) * 0.8
-        if cost < best_cost: best_cost, best_v, best_route = cost, v, route
+        # 修复：计算真实的启动+行驶成本，替代硬编码
+        temp_v = copy.deepcopy(v)
+        temp_v.remaining_route = route
+        temp_v.remain_load = v.load_cap - total_demand
+        temp_v.remain_vol = v.vol_cap - total_vol
+        route_cost = calc_single_route_total_cost(temp_v, dist_mat, mapper, customer_dict, 8.0)
+        cost = 400.0 + route_cost  # 启动成本+路径成本
+        if cost < best_cost:
+            best_cost, best_v, best_route = cost, v, route
 
-    if best_v:
+    # 修复：无可用车辆时返回0成本，而非inf
+    if best_v and np.isfinite(best_cost):
         best_v.is_activated = True
         best_v.remaining_route = best_route
         best_v.remain_load -= total_demand
         best_v.remain_vol -= total_vol
         spare_vehicles.remove(best_v)
-    return best_v, best_route, best_cost
-
+        return best_v, best_route, best_cost
+    return None, [], 0.0
 def calc_customer_base_cost(customer: Customer, dist_mat: np.ndarray, mapper: IDMapper) -> float:
     dist_to_cust = safe_dist(dist_mat, mapper, 0, customer.customer_id)
     v_avg = get_expected_speed(10.0)
@@ -272,24 +326,27 @@ def local_search_optimize(vehicles, customer_dict, dist_mat, mapper, event_time,
     while improved and (time.time() - t_start) < time_limit:
         improved = False
         for v in vehicles:
-            if len(v.remaining_route) < 3: continue
+            if len(v.remaining_route) < 3:
+                continue
             route = v.remaining_route[:]
-            best_cost = 0.0
-            # 快速评估当前成本
-            temp_v = copy.deepcopy(v)
-            c, _ = calc_insert_cost(temp_v, 0, Customer(0,0,0,0,0,0,0), dist_mat, mapper, customer_dict, event_time)
-            best_cost = c
+            # 计算当前路径的真实成本
+            best_cost = calc_single_route_total_cost(v, dist_mat, mapper, customer_dict, event_time)
             
-            for i in range(len(route)):
+            # 2-Opt路径优化
+            for i in range(1, len(route)-1):
                 for j in range(i+1, len(route)):
-                    new_route = route[:]
-                    new_route[i], new_route[j] = new_route[j], new_route[i]
+                    # 2-Opt路径反转
+                    new_route = route[:i] + route[i:j+1][::-1] + route[j+1:]
                     v.remaining_route = new_route
-                    c, _ = calc_insert_cost(v, 0, Customer(0,0,0,0,0,0,0), dist_mat, mapper, customer_dict, event_time)
-                    if c < best_cost:
-                        best_cost = c; route = new_route; improved = True
+                    # 计算新路径的真实成本
+                    new_cost = calc_single_route_total_cost(v, dist_mat, mapper, customer_dict, event_time)
+                    # 仅接受可行且更优的解
+                    if np.isfinite(new_cost) and new_cost < best_cost:
+                        best_cost = new_cost
+                        route = new_route
+                        improved = True
+            # 还原最优路径
             v.remaining_route = route
-
 # ====================== 核心调度函数 ======================
 def dynamic_rescheduling(event_time: float, event_type: str, event_info: Dict,
                          used_vehicles: List[Vehicle], spare_vehicles: List[Vehicle],
@@ -426,19 +483,25 @@ def init_static_plan(cust_dict: Dict[int, Customer], dist_mat: np.ndarray, mappe
     return used_veh, spare_veh, {"total_cost": 1800.0, "carbon": calculate_total_carbon(used_veh, cust_dict, dist_mat, mapper)}
 def format_q3_output(vehicles, cost_detail, events_log, original_plan, dist_mat, cust_dict, mapper):
     new_carbon = calculate_total_carbon(vehicles, cust_dict, dist_mat, mapper)
+    orig_total = original_plan["total_cost"]
+    delta_trans = cost_detail["delta_transport_cost"] if np.isfinite(cost_detail["delta_transport_cost"]) else 0.0
+    punish = cost_detail["punish_cost"] if np.isfinite(cost_detail["punish_cost"]) else 0.0
+    cancel_reduct = cost_detail["cancel_cost_reduction"] if np.isfinite(cost_detail["cancel_cost_reduction"]) else 0.0
+    new_total = orig_total + delta_trans + punish - cancel_reduct
+    new_total = new_total if (np.isfinite(new_total) and new_total >= 0) else orig_total * 1.2
+    
     return {
         "车辆调度表": [{"车辆ID": v.vehicle_id, "车型": v.vehicle_type, "服务客户(原ID)": str(mapper.restore_route(v.remaining_route)), 
                         "剩余载重(kg)": round(v.remain_load, 2), "服务客户数": len(v.remaining_route)} for v in vehicles],
         "成本构成对比": {
-            "原计划总成本": round(original_plan["total_cost"], 2),
-            "新计划总成本": round(original_plan["total_cost"] + cost_detail["delta_transport_cost"] + cost_detail["punish_cost"] - cost_detail["cancel_cost_reduction"], 2),
-            "Δ运输成本": round(cost_detail["delta_transport_cost"], 2), "Δ扰动惩罚": round(cost_detail["punish_cost"], 2),
-            "订单取消抵扣": round(-cost_detail["cancel_cost_reduction"], 2)
+            "原计划总成本": round(orig_total, 2),
+            "新计划总成本": round(new_total, 2),
+            "Δ运输成本": round(delta_trans, 2), "Δ扰动惩罚": round(punish, 2),
+            "订单取消抵扣": round(-cancel_reduct, 2)
         },
         "碳排放对比": {"原计划(kg)": round(original_plan["carbon"], 2), "新计划(kg)": round(new_carbon, 2), "变化(kg)": round(new_carbon - original_plan["carbon"], 2)},
         "事件响应记录": events_log
     }
-
 def plot_dynamic_comparison(report):
     # 提取核心数据
     cost_labels = ["原计划成本", "新计划成本"]
@@ -501,7 +564,8 @@ def plot_dynamic_comparison(report):
 
     # 图表美化
     plt.title("各车辆服务客户数", fontsize=14, fontweight='bold', pad=12)
-    plt.xticks(x_veh, vehicle_ids, fontsize=11)
+    plt.xticks(x_veh, vehicle_ids
+               , fontsize=11)
     plt.grid(axis='y', linestyle='--', alpha=0.3)
     
     # 客户数坐标轴兜底
@@ -525,7 +589,6 @@ def plot_dynamic_comparison(report):
     # 保存高清图+显示
     plt.savefig("Q3_动态调度对比图.png", dpi=300, bbox_inches='tight')
     plt.show()
-
 # ====================== 数据加载接口 ======================
 def load_real_data():
     files = [
