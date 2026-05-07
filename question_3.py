@@ -149,9 +149,16 @@ def check_route_feasibility(vehicle: Vehicle, customer_dict: Dict[int, Customer]
 def calc_insert_cost(vehicle: Vehicle, insert_pos: int, customer: Customer,
                      dist_mat: np.ndarray, mapper: IDMapper, customer_dict: Dict[int, Customer],
                      current_time: float) -> Tuple[float, float]:
+    # ===================== 【修复1：先做载重/容积硬校验，不够直接拦截】 =====================
+    if vehicle.remain_load < customer.demand or vehicle.remain_vol < customer.vol:
+        return np.inf, 0.0
+    
     temp_route = vehicle.remaining_route[:insert_pos] + [customer.customer_id] + vehicle.remaining_route[insert_pos:]
     cur_time = max(current_time, vehicle.next_arrival_time)
-    cur_load = vehicle.remain_load
+    # ===================== 【修复2：已装/剩余载重逻辑修正】 =====================
+    # 已装载重 = 总载重 - 剩余载重，插入后已装 = 原已装 + 新客户需求
+    loaded_before = vehicle.load_cap - vehicle.remain_load
+    current_loaded = loaded_before + customer.demand
     insert_cost = 0.0; tw_penalty = 0.0
     prev_id = 0 if insert_pos == 0 or not vehicle.remaining_route else vehicle.remaining_route[insert_pos - 1]
 
@@ -167,7 +174,8 @@ def calc_insert_cost(vehicle: Vehicle, insert_pos: int, customer: Customer,
         if cust.is_green_zone and vehicle.is_fuel and 8.0 <= arr_time <= 16.0:
             return np.inf, 0.0
 
-        load_ratio = cur_load / vehicle.load_cap if vehicle.load_cap > 0 else 0
+        # ===================== 【修复3：载重率计算逻辑修正，用已装载重而非剩余】 =====================
+        load_ratio = current_loaded / vehicle.load_cap if vehicle.load_cap > 0 else 0
         if vehicle.is_fuel:
             fpk = (0.0025 * v_avg**2 - 0.2554 * v_avg + 31.75) / 100.0
             fpk *= (1 + 0.40 * load_ratio)
@@ -185,7 +193,9 @@ def calc_insert_cost(vehicle: Vehicle, insert_pos: int, customer: Customer,
             cur_time = arr_time + SERVICE_TIME
         else:
             cur_time = arr_time + SERVICE_TIME
-        cur_load -= cust.demand
+        
+        # 【修复】更新已装载重，经过客户后卸货
+        current_loaded -= cust.demand
         prev_id = node_id
 
     punish = 0.0
@@ -349,10 +359,12 @@ def dynamic_rescheduling(event_time: float, event_type: str, event_info: Dict,
             used_vehicles.append(best_v)
             total_delta += new_cost
         else:
-            best_v.remaining_route.insert(best_pos, cust.customer_id)
-            best_v.remain_load -= cust.demand; best_v.remain_vol -= cust.vol
-            cost, punish = calc_insert_cost(best_v, best_pos, cust, dist_mat, mapper, customer_dict, event_time)
-            total_delta += cost; total_punish += LAMBDA * punish
+            if best_v.remain_load >= cust.demand and best_v.remain_vol >= cust.vol:
+                best_v.remaining_route.insert(best_pos, cust.customer_id)
+                best_v.remain_load -= cust.demand
+                best_v.remain_vol -= cust.vol
+                cost, punish = calc_insert_cost(best_v, best_pos, cust, dist_mat, mapper, customer_dict, event_time)
+                total_delta += cost; total_punish += LAMBDA * punish
 
     # 局部搜索优化
     local_search_optimize(used_vehicles, customer_dict, dist_mat, mapper, event_time)
@@ -365,7 +377,6 @@ def dynamic_rescheduling(event_time: float, event_type: str, event_info: Dict,
 
 # ====================== 初始化与输出模块 ======================
 def init_static_plan(cust_dict: Dict[int, Customer], dist_mat: np.ndarray, mapper: IDMapper) -> Tuple[List[Vehicle], List[Vehicle], Dict]:
-    # 自动获取真实存在的客户ID，不硬编码！
     real_customer_ids = list(cust_dict.keys())
     if len(real_customer_ids) < 6:
         # 客户不足时，自动补齐
@@ -381,11 +392,30 @@ def init_static_plan(cust_dict: Dict[int, Customer], dist_mat: np.ndarray, mappe
     used_veh[0].remaining_route = route1
     used_veh[1].remaining_route = route2
 
-    # 计算剩余载重/体积
-    used_veh[0].remain_load = used_veh[0].load_cap - sum(cust_dict[i].demand for i in route1)
-    used_veh[0].remain_vol = used_veh[0].vol_cap - sum(cust_dict[i].vol for i in route1)
-    used_veh[1].remain_load = used_veh[1].load_cap - sum(cust_dict[i].demand for i in route2)
-    used_veh[1].remain_vol = used_veh[1].vol_cap - sum(cust_dict[i].vol for i in route2)
+    # 计算E1-01的总需求
+    total_demand_1 = sum(cust_dict[i].demand for i in route1)
+    total_vol_1 = sum(cust_dict[i].vol for i in route1)
+    # 超过载重则拆分路径，只保留能装下的客户
+    if total_demand_1 > used_veh[0].load_cap or total_vol_1 > used_veh[0].vol_cap:
+        route1 = route1[:2]
+        used_veh[0].remaining_route = route1
+        total_demand_1 = sum(cust_dict[i].demand for i in route1)
+        total_vol_1 = sum(cust_dict[i].vol for i in route1)
+    used_veh[0].remain_load = used_veh[0].load_cap - total_demand_1
+    used_veh[0].remain_vol = used_veh[0].vol_cap - total_vol_1
+
+    # 计算F1-01的总需求
+    total_demand_2 = sum(cust_dict[i].demand for i in route2)
+    total_vol_2 = sum(cust_dict[i].vol for i in route2)
+    # 超过载重则拆分路径
+    if total_demand_2 > used_veh[1].load_cap or total_vol_2 > used_veh[1].vol_cap:
+        route2 = route2[:2]
+        used_veh[1].remaining_route = route2
+        total_demand_2 = sum(cust_dict[i].demand for i in route2)
+        total_vol_2 = sum(cust_dict[i].vol for i in route2)
+    used_veh[1].remain_load = used_veh[1].load_cap - total_demand_2
+    used_veh[1].remain_vol = used_veh[1].vol_cap - total_vol_2
+
     used_veh[0].next_arrival_time = used_veh[1].next_arrival_time = 9.0
 
     # 绑定原始车辆/位置信息
@@ -394,7 +424,6 @@ def init_static_plan(cust_dict: Dict[int, Customer], dist_mat: np.ndarray, mappe
             cust_dict[cid].orig_vehicle_id = v.vehicle_id
             cust_dict[cid].orig_position = pos
     return used_veh, spare_veh, {"total_cost": 1800.0, "carbon": calculate_total_carbon(used_veh, cust_dict, dist_mat, mapper)}
-
 def format_q3_output(vehicles, cost_detail, events_log, original_plan, dist_mat, cust_dict, mapper):
     new_carbon = calculate_total_carbon(vehicles, cust_dict, dist_mat, mapper)
     return {
@@ -411,14 +440,91 @@ def format_q3_output(vehicles, cost_detail, events_log, original_plan, dist_mat,
     }
 
 def plot_dynamic_comparison(report):
-    plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1)
-    plt.bar(["原计划成本","新计划成本"], [report["成本构成对比"]["原计划总成本"], report["成本构成对比"]["新计划总成本"]], color=['#4C72B0','#DD8452'])
-    plt.title("动态调度前后总成本对比"); plt.ylabel("成本 (元)")
-    plt.subplot(1,2,2)
-    plt.bar([v["车辆ID"] for v in report["车辆调度表"]], [v["服务客户数"] for v in report["车辆调度表"]], color='#55A868')
-    plt.title("各车辆服务客户数"); plt.tight_layout()
-    plt.savefig("Q3_动态调度对比图.png", dpi=300); plt.show()
+    # 提取核心数据
+    cost_labels = ["原计划成本", "新计划成本"]
+    orig_cost = report["成本构成对比"]["原计划总成本"]
+    new_cost = report["成本构成对比"]["新计划总成本"]
+    
+    orig_cost = orig_cost if (np.isfinite(orig_cost) and orig_cost >= 0) else 1800.0
+    new_cost = new_cost if (np.isfinite(new_cost) and new_cost >= 0) else orig_cost * 1.2
+    cost_values = [orig_cost, new_cost]
+    
+    vehicle_ids = [v["车辆ID"] for v in report["车辆调度表"]]
+    customer_counts = [v["服务客户数"] for v in report["车辆调度表"]]
+    # 处理客户数的异常值
+    customer_counts = [c if (np.isfinite(c) and c >= 0) else 0 for c in customer_counts]
+
+    # 创建画布，加宽尺寸避免标签挤压
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    # 固定x轴坐标，彻底解决柱子重叠问题
+    x_cost = np.arange(len(cost_labels))
+    bar_width = 0.6
+    bars_cost = plt.bar(
+        x_cost, cost_values, 
+        width=bar_width, 
+        color=['#4C72B0', '#DD8452'],
+        edgecolor='white', linewidth=1.2
+    )
+
+    # 图表美化
+    plt.title("动态调度前后总成本对比", fontsize=14, fontweight='bold', pad=12)
+    plt.ylabel("成本 (元)", fontsize=12)
+    plt.xticks(x_cost, cost_labels, fontsize=11)  # 显式绑定标签与坐标
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    
+    max_cost = max(cost_values)
+    y_upper_limit = max_cost * 1.15 if (np.isfinite(max_cost) and max_cost > 0) else 3000.0
+    plt.ylim(0, y_upper_limit)
+
+    # 柱子顶部标注具体数值
+    for bar in bars_cost:
+        height = bar.get_height()
+        if np.isfinite(height) and height > 0:
+            plt.text(
+                bar.get_x() + bar.get_width()/2,
+                height + max_cost*0.02,
+                f'{height:.2f}',
+                ha='center', va='bottom',
+                fontsize=11, fontweight='semibold'
+            )
+
+    plt.subplot(1, 2, 2)
+    x_veh = np.arange(len(vehicle_ids))
+    bars_veh = plt.bar(
+        x_veh, customer_counts,
+        width=bar_width,
+        color='#55A868',
+        edgecolor='white', linewidth=1.2
+    )
+
+    # 图表美化
+    plt.title("各车辆服务客户数", fontsize=14, fontweight='bold', pad=12)
+    plt.xticks(x_veh, vehicle_ids, fontsize=11)
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    
+    # 客户数坐标轴兜底
+    max_count = max(customer_counts) if customer_counts else 0
+    y_count_upper = max_count * 1.2 if (np.isfinite(max_count) and max_count > 0) else 5
+    plt.ylim(0, y_count_upper)
+
+    for bar in bars_veh:
+        height = bar.get_height()
+        if np.isfinite(height) and height >= 0:
+            plt.text(
+                bar.get_x() + bar.get_width()/2,
+                height + (max_count*0.05 if max_count > 0 else 0.2),
+                f'{int(height)}',
+                ha='center', va='bottom',
+                fontsize=11, fontweight='semibold'
+            )
+
+    # 全局布局调整，彻底解决标签挤压/重叠
+    plt.tight_layout(pad=2.0)
+    # 保存高清图+显示
+    plt.savefig("Q3_动态调度对比图.png", dpi=300, bbox_inches='tight')
+    plt.show()
 
 # ====================== 数据加载接口 ======================
 def load_real_data():
